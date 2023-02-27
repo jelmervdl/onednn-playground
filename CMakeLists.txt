@@ -24,6 +24,8 @@ ExternalProject_Add(oneDNN
 set(ONEDNN_INCLUDE_DIR ${CMAKE_CURRENT_BINARY_DIR}/oneDNN/include)
 set(ONEDNN_LIB_DIR ${CMAKE_CURRENT_BINARY_DIR}/oneDNN/lib)
 
+include_directories(${ONEDNN_INCLUDE_DIR})
+
 add_library(oneDNN::lib STATIC IMPORTED)
 add_dependencies(oneDNN::lib oneDNN)
 set_target_properties(oneDNN::lib PROPERTIES IMPORTED_LOCATION ${ONEDNN_LIB_DIR}/libdnnl.a)
