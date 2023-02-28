@@ -1,9 +1,11 @@
 #include <algorithm>
-#include <cmath>
+#include <cmath> // sin, tan, cos
+#include <cstring> // memcpy
 #include <iostream>
 #include <numeric>
 #include <unordered_map>
 #include <vector>
+#include "../3rd_party/cnpy/cnpy.h"
 #include "oneapi/dnnl/dnnl.hpp"
 
 using namespace dnnl;
@@ -13,10 +15,10 @@ using dt = memory::data_type;
 
 
 dnnl::memory::dim product(const dnnl::memory::dims &dims) {
-  return std::accumulate(
-  	dims.begin(),
-  	dims.end(),
-  	(dnnl::memory::dim) 1,
+	return std::accumulate(
+		dims.begin(),
+		dims.end(),
+		(dnnl::memory::dim) 1,
 		std::multiplies<dnnl::memory::dim>());
 }
 
@@ -25,105 +27,171 @@ void read_from_dnnl_memory(void *handle, dnnl::memory &mem) {
 	dnnl::engine eng = mem.get_engine();
 	size_t size = mem.get_desc().get_size();
 	uint8_t *src = static_cast<uint8_t *>(mem.get_data_handle());
-  if (!src) throw std::runtime_error("get_data_handle returned nullptr.");
-  for (size_t i = 0; i < size; ++i)
-    ((uint8_t *) handle)[i] = src[i];
+	if (!src) throw std::runtime_error("get_data_handle returned nullptr.");
+	for (size_t i = 0; i < size; ++i)
+		((uint8_t *) handle)[i] = src[i];
 }
 
 
 void write_to_dnnl_memory(void *handle, dnnl::memory &mem) {
-  dnnl::engine eng = mem.get_engine();
-  size_t size = mem.get_desc().get_size();
-  if (!handle) throw std::runtime_error("handle is nullptr.");
+	dnnl::engine eng = mem.get_engine();
+	size_t size = mem.get_desc().get_size();
+	if (!handle) throw std::runtime_error("handle is nullptr.");
 	uint8_t *dst = static_cast<uint8_t *>(mem.get_data_handle());
-  if (!dst) throw std::runtime_error("get_data_handle returned nullptr.");
-  for (size_t i = 0; i < size; ++i)
-      dst[i] = ((uint8_t *) handle)[i];
+	if (!dst) throw std::runtime_error("get_data_handle returned nullptr.");
+	for (size_t i = 0; i < size; ++i)
+			dst[i] = ((uint8_t *) handle)[i];
 }
 
+struct Expert {
+	std::size_t size;
+	std::vector<float> weights;
+	std::vector<float> bias;
+	
+	Expert(std::size_t size, const float *w_data, const float *b_data) :
+		size(size),
+		weights(w_data, w_data + size * size),
+		bias(b_data, b_data + size)
+	{
+		//
+	}
+};
 
-int main() {
+int main(int argc, char** argv) {
+	assert(argc > 1);
+	auto data = cnpy::npz_load(argv[1]);
+
 	dnnl::engine engine(dnnl::engine::kind::cpu, 0);
 
 	dnnl::stream engine_stream(engine);
 
 	// Tensor dimensions.
-  const memory::dim MB = 3, // batch size
-          M = 128, K = 256, N = 512;
+	const memory::dim expert_count = 3, token_count = 7, embedding_size = 5;
 
-  // Source (src), weights, bias, and destination (dst) tensors dimensions.
-  memory::dims src_dims = {MB, M, K};
-  memory::dims weights_dims = {MB, K, N};
-  memory::dims bias_dims = {1, 1, N};
-  memory::dims dst_dims = {MB, M, N};
+	// Source (src), weights, bias, and destination (dst) tensors dimensions.
+	memory::dims src_dims = {token_count, embedding_size};
+	memory::dims dst_dims = {token_count, embedding_size};
 
-  // Allocate buffers.
-  std::vector<float> src_data(product(src_dims));
-  std::vector<float> weights_data(product(weights_dims));
-  std::vector<float> bias_data(product(bias_dims));
-  std::vector<float> dst_data(product(dst_dims));
+	memory::dims expert_w_dims = {embedding_size, embedding_size};
+	memory::dims expert_b_dims = {1, embedding_size};
 
-  // Initialize src, weights, bias.
-  std::generate(src_data.begin(), src_data.end(), []() {
-      static int i = 0;
-      return std::cos(i++ / 10.f);
-  });
-  std::generate(weights_data.begin(), weights_data.end(), []() {
-      static int i = 0;
-      return std::sin(i++ * 2.f);
-  });
-  std::generate(bias_data.begin(), bias_data.end(), []() {
-      static int i = 0;
-      return std::tanh(float(i++));
-  });
+	// Initialize some source data
+	assert(product(src_dims) == data["src"].num_vals);
+	std::vector<float> src_data(data["src"].as_vec<float>());
 
-  // Create memory descriptors and memory objects for src, weights, bias, and
-  // dst.
-  auto src_md = memory::desc(src_dims, dt::f32, tag::abc);
-  auto weights_md = memory::desc(weights_dims, dt::f32, tag::abc);
-  auto bias_md = memory::desc(bias_dims, dt::f32, tag::abc);
-  auto dst_md = memory::desc(dst_dims, dt::f32, tag::abc);
+	std::vector<float> dst_data(product(dst_dims));
 
-  auto src_mem = memory(src_md, engine);
-  auto weights_mem = memory(weights_md, engine);
-  auto bias_mem = memory(bias_md, engine);
-  auto dst_mem = memory(dst_md, engine);
+	// Initialize router with some random data
 
-  // Write data to memory object's handles.
-  write_to_dnnl_memory(src_data.data(), src_mem);
-  write_to_dnnl_memory(weights_data.data(), weights_mem);
-  write_to_dnnl_memory(bias_data.data(), bias_mem);
+	assert(expert_count * token_count == data["router"].num_vals);
+	std::vector<uint8_t> router(data["router"].as_vec<uint8_t>());
 
-  // Create primitive post-ops (ReLU).
-  const float alpha = 0.f;
-  const float beta = 0.f;
-  post_ops matmul_ops;
-  matmul_ops.append_eltwise(algorithm::eltwise_relu, alpha, beta);
-  primitive_attr matmul_attr;
-  matmul_attr.set_post_ops(matmul_ops);
+	// Initialize experts with rubbish
 
-  // Create primitive descriptor.
-  auto matmul_pd = matmul::primitive_desc(
-          engine, src_md, weights_md, bias_md, dst_md, matmul_attr);
+	std::vector<Expert> experts;
 
-  // Create the primitive.
-  auto matmul_prim = matmul(matmul_pd);
+	for (size_t i = 0; i < expert_count; ++i) {
+		experts.emplace_back(
+			embedding_size,
+			data["experts_w"].data<float>() + i * embedding_size * embedding_size,
+			data["experts_b"].data<float>() + i * embedding_size
+		);
+	}
 
-  // Primitive arguments.
-  std::unordered_map<int, memory> matmul_args;
-  matmul_args.insert({DNNL_ARG_SRC, src_mem});
-  matmul_args.insert({DNNL_ARG_WEIGHTS, weights_mem});
-  matmul_args.insert({DNNL_ARG_BIAS, bias_mem});
-  matmul_args.insert({DNNL_ARG_DST, dst_mem});
+	// ... and so it begins ...
 
-  // Primitive execution: matrix multiplication with ReLU.
-  matmul_prim.execute(engine_stream, matmul_args);
+	// Create memory descriptors and memory objects
+	auto src_desc = memory::desc(src_dims, dt::f32, tag::ab);
+	auto dst_desc = memory::desc(dst_dims, dt::f32, tag::ab);
 
-  // Wait for the computation to finalize.
-  engine_stream.wait();
+	auto src_mem = memory(src_desc, engine, src_data.data());
+	auto dst_mem = memory(dst_desc, engine, dst_data.data());
+	
+	std::vector<memory::desc> concat_src_desc;
+	std::vector<memory> concat_src_mems;
 
-  // Read data from memory object's handle.
-  read_from_dnnl_memory(dst_data.data(), dst_mem);
+	concat_src_desc.reserve(token_count);
+	concat_src_mems.reserve(token_count);
 
-  return 0;
+	for (size_t i = 0; i < expert_count; ++i) {
+		concat_src_desc.clear();
+		concat_src_mems.clear();
+
+		for (auto j = expert_count * i, end = expert_count * (i + 1); j != end; ++j) {
+			if (!router[j])
+				continue;
+
+			concat_src_desc.emplace_back(memory::dims{1, embedding_size}, dt::f32, tag::ab);
+			concat_src_mems.emplace_back(concat_src_desc.back(), engine,
+				reinterpret_cast<float*>(src_mem.get_data_handle()) + j * embedding_size); // make the dnnl::memory object a view of a small part of the original input memory
+		}
+
+		memory::dim expert_token_count = concat_src_mems.size();
+
+		// Create concat primitive descriptor.
+		auto concat_desc = concat::primitive_desc(engine, 0, concat_src_desc);
+		auto concat_prim = concat(concat_desc);
+
+		std::unordered_map<int, memory> concat_args;
+		for (int n = 0; n < concat_src_mems.size(); ++n) {
+			concat_args.insert({DNNL_ARG_MULTIPLE_SRC + n, concat_src_mems[n]});
+		}
+		
+		auto expert_src_desc = memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab);
+		auto expert_src_mem = memory(expert_src_desc, engine);
+		concat_args.insert({DNNL_ARG_DST, expert_src_mem});
+
+		concat_prim.execute(engine_stream, concat_args);
+
+		auto expert_dst_desc = memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab);
+		auto expert_dst_mem = memory(expert_dst_desc, engine);
+
+		auto expert_weights_desc = memory::desc(expert_w_dims, dt::f32, tag::ab);
+		auto expert_weights_mem = memory(expert_weights_desc, engine, experts[i].weights.data());
+		
+		auto expert_bias_desc = memory::desc(expert_b_dims, dt::f32, tag::ab);
+		auto expert_bias_mem = memory(expert_bias_desc, engine, experts[i].bias.data());
+
+		// Create primitive descriptor.
+		auto matmul_desc = matmul::primitive_desc(engine,
+			expert_src_desc,
+			expert_weights_desc,
+			expert_bias_desc,
+			expert_dst_desc);
+
+		// Create the primitive.
+		auto matmul_prim = matmul(matmul_desc);
+
+		// Primitive arguments.
+		std::unordered_map<int, memory> matmul_args;
+		matmul_args.insert({DNNL_ARG_SRC,     expert_src_mem});
+		matmul_args.insert({DNNL_ARG_WEIGHTS, expert_weights_mem});
+		matmul_args.insert({DNNL_ARG_BIAS,    expert_bias_mem});
+		matmul_args.insert({DNNL_ARG_DST,     expert_dst_mem});
+
+		// Primitive execution: matrix multiplication
+		matmul_prim.execute(engine_stream, matmul_args);
+
+		// Copy results from expert back to final output memory
+		// TODO: Find way to do this with oneDNN primitives
+		engine_stream.wait();
+		
+		for (auto j = 0, dst_offset = 0; j < expert_token_count; ++j, ++dst_offset) {
+			// Find the next True in the router to figure out the offset in dst_mem
+			while (!router[expert_count * i + dst_offset])
+				++dst_offset;
+
+			std::memcpy(
+				reinterpret_cast<float*>(dst_mem.get_data_handle()) + (embedding_size * dst_offset),
+				reinterpret_cast<float*>(expert_dst_mem.get_data_handle()) + (embedding_size * j),
+				embedding_size * sizeof(float));
+		}
+	}
+
+	// Wait for the computation to finalize.
+	engine_stream.wait();
+
+	// TODO: Compare output
+
+	return 0;
 }

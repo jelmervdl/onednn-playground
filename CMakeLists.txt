@@ -31,5 +31,7 @@ add_library(oneDNN::lib STATIC IMPORTED)
 add_dependencies(oneDNN::lib oneDNN)
 set_target_properties(oneDNN::lib PROPERTIES IMPORTED_LOCATION ${ONEDNN_LIB_DIR}/libdnnl.a)
 
+add_subdirectory("3rd_party/cnpy")
+
 add_subdirectory("src")
 
