@@ -11,6 +11,7 @@ project("intel-moe")
 include(ExternalProject)
 ExternalProject_Add(oneDNN
 	PREFIX ${CMAKE_CURRENT_BINARY_DIR}/oneDNN
+	UPDATE_COMMAND "" # Disable updating because we're using a fixed tag anyway
 	GIT_REPOSITORY https://github.com/oneapi-src/oneDNN.git
 	GIT_TAG v3.0.1
 	CMAKE_ARGS
