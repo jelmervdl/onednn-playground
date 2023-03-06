@@ -207,8 +207,8 @@ int main(int argc, char** argv) {
 			if (!router[token_count * i + j])
 				continue;
 
-			concat_src_desc.emplace_back(memory::dims{1, embedding_size}, dt::f32, tag::ab);
-			concat_src_mems.emplace_back(concat_src_desc.back(), engine, reinterpret_cast<float*>(src_mem.get_data_handle()) + j * embedding_size); // make the dnnl::memory object a view of a small part of the original input memory
+			concat_src_desc.emplace_back(src_desc.submemory_desc(memory::dims{1, embedding_size}, {j, 0}));
+			concat_src_mems.emplace_back(concat_src_desc.back(), engine, src_mem.get_data_handle()); // make the dnnl::memory object a view of a small part of the original input memory
 			concat_args.insert({DNNL_ARG_MULTIPLE_SRC + (concat_src_mems.size() - 1), concat_src_mems.back()});
 		}
 
