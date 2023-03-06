@@ -10,7 +10,11 @@
 #include "oneapi/dnnl/dnnl.hpp"
 #include "oneapi/dnnl/dnnl_types.h"
 
+// Uncomment for using oneDNN for index_select. Otherwise memcpy will be used.
 #define CONCAT_INDEX_SELECT
+
+// Uncomment for index_restore using oneDNN concat at the end. Otherwise a
+// memcpy after each expert will be used.
 #define CONCAT_INDEX_RESTORE
 
 using namespace dnnl;
@@ -304,11 +308,6 @@ int main(int argc, char** argv) {
 		
 #ifndef CONCAT_INDEX_RESTORE
 		// Copy results from expert back to final output memory
-		// TODO: Find way to do this with oneDNN primitives. concat at the end could
-		// work but we would have to keep all our expert_i_dst memory around until
-		// we've processed all experts. Alternatively we concat slices of
-		// dst_mem and expert_dst_mem onto dst_mem but copying to the same target
-		// region sounds even worse.
 		engine_stream.wait();
 
 		for (auto j = 0, dst_offset = 0; j < expert_token_count; ++j, ++dst_offset) {
@@ -328,6 +327,9 @@ int main(int argc, char** argv) {
 	}
 
 #ifdef CONCAT_INDEX_RESTORE
+	// Silly way of restoring the final output matrix by selectively concatinating
+	// from the various expert output matrices. I don't see how this can scale to
+	// a large number of experts.
 	std::unordered_map<int, memory> dst_concat_args;
 	std::vector<memory::desc> dst_concat_descs;
 	std::vector<memory> dst_concat_mems;
@@ -341,7 +343,7 @@ int main(int argc, char** argv) {
 			if (!router[token_count * i + j])
 				continue;
 
-			std::cerr << "For token " << j << " we take row " << expert_src_offsets[i] << " from expert " << i << std::endl;
+			// std::cerr << "For token " << j << " we take row " << expert_src_offsets[i] << " from expert " << i << std::endl;
 			dst_concat_descs.emplace_back(expert_dst_descs[i].submemory_desc({1, embedding_size}, {expert_src_offsets[i]++, 0}));
 			dst_concat_mems.emplace_back(dst_concat_descs.back(), engine, expert_dst_mems[i].get_data_handle());
 			dst_concat_args.insert({DNNL_ARG_MULTIPLE_SRC + j, dst_concat_mems.back()});
