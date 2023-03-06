@@ -8,6 +8,10 @@
 #include <vector>
 #include "../3rd_party/cnpy/cnpy.h"
 #include "oneapi/dnnl/dnnl.hpp"
+#include "oneapi/dnnl/dnnl_types.h"
+
+#define CONCAT_INDEX_SELECT
+#define CONCAT_INDEX_RESTORE
 
 using namespace dnnl;
 
@@ -190,14 +194,22 @@ int main(int argc, char** argv) {
 	bypass_prim.execute(engine_stream, bypass_args);
 
 	// Memory used by concat primitive to create an expert's input
+#ifdef CONCAT_INDEX_SELECT
 	std::vector<memory::desc> concat_src_desc;
 	std::vector<memory> concat_src_mems;
 
 	concat_src_desc.reserve(token_count);
 	concat_src_mems.reserve(token_count);
 	std::unordered_map<int, memory> concat_args;
+#endif
+
+#ifdef CONCAT_INDEX_RESTORE
+	std::vector<memory::desc> expert_dst_descs;
+	std::vector<memory> expert_dst_mems;
+#endif
 
 	for (size_t i = 0; i < expert_count; ++i) {
+#ifdef CONCAT_INDEX_SELECT
 		// === oneDNN call to concat() to select rows for expert ===
 		concat_src_desc.clear();
 		concat_src_mems.clear();
@@ -207,8 +219,9 @@ int main(int argc, char** argv) {
 			if (!router[token_count * i + j])
 				continue;
 
+			// make the dnnl::memory object a view of a small part of the original input memory
 			concat_src_desc.emplace_back(src_desc.submemory_desc(memory::dims{1, embedding_size}, {j, 0}));
-			concat_src_mems.emplace_back(concat_src_desc.back(), engine, src_mem.get_data_handle()); // make the dnnl::memory object a view of a small part of the original input memory
+			concat_src_mems.emplace_back(concat_src_desc.back(), engine, src_mem.get_data_handle());
 			concat_args.insert({DNNL_ARG_MULTIPLE_SRC + (concat_src_mems.size() - 1), concat_src_mems.back()});
 		}
 
@@ -225,8 +238,7 @@ int main(int argc, char** argv) {
 		concat_prim.execute(engine_stream, concat_args);
 
 		engine_stream.wait(); // Purely for debugging
-
-		/*
+#else
 		// === Naive implementation of concat ===
 		memory::dim expert_token_count = std::accumulate(&router[token_count * i], &router[token_count * (i + 1)], 0, [](uint8_t acc, uint8_t val) {
 			return acc + (val ? 1 : 0);
@@ -246,14 +258,19 @@ int main(int argc, char** argv) {
 				reinterpret_cast<float*>(src_mem.get_data_handle()) + (embedding_size * j),
 				embedding_size * sizeof(float));
 		}
-		*/
+#endif
 
 		std::cout << "expert_" << i << "_src_mem = " << matrix<float>{
 			static_cast<size_t>(expert_token_count), embedding_size,
 			reinterpret_cast<float*>(expert_src_mem.get_data_handle())};
 
+#ifdef CONCAT_INDEX_RESTORE
+		auto expert_dst_desc = expert_dst_descs.emplace_back(memory::dims{expert_token_count, embedding_size}, dt::f32, tag::ab);
+		auto expert_dst_mem = expert_dst_mems.emplace_back(expert_dst_descs.back(), engine);
+#else
 		auto expert_dst_desc = memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab);
 		auto expert_dst_mem = memory(expert_dst_desc, engine);
+#endif
 
 		auto expert_weights_desc = memory::desc(expert_w_dims, dt::f32, tag::ab);
 		auto expert_weights_mem = memory(expert_weights_desc, engine, experts[i].weights.data());
@@ -285,8 +302,13 @@ int main(int argc, char** argv) {
 		std::cout << "expert_" << i << "_dst = " << matrix<float>{static_cast<size_t>(expert_token_count), embedding_size, reinterpret_cast<float*>(expert_dst_mem.get_data_handle())};
 		std::cout << "expected expert_" << i << "_dst_mem = " << matrix<float>{static_cast<size_t>(expert_token_count), embedding_size, data[format("expert_{}_dst", i)].data<float>()};
 		
+#ifndef CONCAT_INDEX_RESTORE
 		// Copy results from expert back to final output memory
-		// TODO: Find way to do this with oneDNN primitives
+		// TODO: Find way to do this with oneDNN primitives. concat at the end could
+		// work but we would have to keep all our expert_i_dst memory around until
+		// we've processed all experts. Alternatively we concat slices of
+		// dst_mem and expert_dst_mem onto dst_mem but copying to the same target
+		// region sounds even worse.
 		engine_stream.wait();
 
 		for (auto j = 0, dst_offset = 0; j < expert_token_count; ++j, ++dst_offset) {
@@ -300,13 +322,44 @@ int main(int argc, char** argv) {
 				embedding_size * sizeof(float));
 		}
 
+		engine_stream.wait(); // for debugging only
 		std::cout << "dst_data (after expert " << i << ") = " << matrix<float>{token_count, embedding_size, reinterpret_cast<float*>(dst_mem.get_data_handle())};
+#endif
 	}
 
-	std::cout << "expected dst_data = " << matrix<float>{token_count, embedding_size, data["dst"].data<float>()};
+#ifdef CONCAT_INDEX_RESTORE
+	std::unordered_map<int, memory> dst_concat_args;
+	std::vector<memory::desc> dst_concat_descs;
+	std::vector<memory> dst_concat_mems;
+
+	// Offsets which row inside each expert we're at
+	std::vector<memory::dim> expert_src_offsets(expert_count, 0);
+
+	for (auto j = 0; j < token_count; ++j) {
+		for (auto i = 0; i < expert_count; ++i) {
+			// Find the expert that is responsible for this token j.
+			if (!router[token_count * i + j])
+				continue;
+
+			std::cerr << "For token " << j << " we take row " << expert_src_offsets[i] << " from expert " << i << std::endl;
+			dst_concat_descs.emplace_back(expert_dst_descs[i].submemory_desc({1, embedding_size}, {expert_src_offsets[i]++, 0}));
+			dst_concat_mems.emplace_back(dst_concat_descs.back(), engine, expert_dst_mems[i].get_data_handle());
+			dst_concat_args.insert({DNNL_ARG_MULTIPLE_SRC + j, dst_concat_mems.back()});
+			break; // Go to next token
+		}
+	}
+
+	auto dst_concat_desc = concat::primitive_desc(engine, 0, dst_concat_descs);
+	auto dst_concat_prim = concat(dst_concat_desc);
+
+	dst_concat_args.insert({DNNL_ARG_DST, dst_mem});
+	dst_concat_prim.execute(engine_stream, dst_concat_args);
+#endif
 
 	// Wait for the computation to finalize.
-	// engine_stream.wait();
+	engine_stream.wait();
+	std::cout << "final dst_data =    " << matrix<float>{token_count, embedding_size, reinterpret_cast<float*>(dst_mem.get_data_handle())};
+	std::cout << "expected dst_data = " << matrix<float>{token_count, embedding_size, data["dst"].data<float>()};
 
 	// === Compare output ===
 	float summed_abs_diff = 0;
