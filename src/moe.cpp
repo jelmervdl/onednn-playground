@@ -22,7 +22,7 @@ using namespace dnnl;
 using tag = memory::format_tag;
 using dt = memory::data_type;
 
-
+// Shortcut for getting size of a {a,b,c} sized tensor.
 dnnl::memory::dim product(const dnnl::memory::dims &dims) {
 	return std::accumulate(
 		dims.begin(),
@@ -31,27 +31,7 @@ dnnl::memory::dim product(const dnnl::memory::dims &dims) {
 		std::multiplies<dnnl::memory::dim>());
 }
 
-
-void read_from_dnnl_memory(void *handle, dnnl::memory &mem) {
-	dnnl::engine eng = mem.get_engine();
-	size_t size = mem.get_desc().get_size();
-	uint8_t *src = static_cast<uint8_t *>(mem.get_data_handle());
-	if (!src) throw std::runtime_error("get_data_handle returned nullptr.");
-	for (size_t i = 0; i < size; ++i)
-		((uint8_t *) handle)[i] = src[i];
-}
-
-
-void write_to_dnnl_memory(void *handle, dnnl::memory &mem) {
-	dnnl::engine eng = mem.get_engine();
-	size_t size = mem.get_desc().get_size();
-	if (!handle) throw std::runtime_error("handle is nullptr.");
-	uint8_t *dst = static_cast<uint8_t *>(mem.get_data_handle());
-	if (!dst) throw std::runtime_error("get_data_handle returned nullptr.");
-	for (size_t i = 0; i < size; ++i)
-			dst[i] = ((uint8_t *) handle)[i];
-}
-
+// Utility templates for printing 2D tensors to ostreams.
 template <typename T>
 struct matrix {
 	size_t w;
@@ -69,6 +49,7 @@ std::ostream &operator<<(std::ostream &out, number<T> const &number) {
 	return out << std::fixed << std::setw(8) << number.val;
 }
 
+// (Bloody hack to print uint8_t as numbers, not characters)
 template <>
 std::ostream &operator<<(std::ostream &out, number<uint8_t> const &number) {
 	return out << std::fixed << std::setw(4) << static_cast<size_t>(number.val);
@@ -94,9 +75,9 @@ std::ostream &operator<<(std::ostream &out, matrix<T> const &matrix) {
 	return out << std::setprecision(default_precision) << std::setw(default_width);
 }
 
-/// Very simple replacement for std::format introduced in C++20. Only supports
-/// replacing `{}` in the template string with whatever `operator<<` for that
-/// type turns it into.
+// Very simple replacement for std::format introduced in C++20. Only supports
+// replacing `{}` in the template string with whatever `operator<<` for that
+// type turns it into.
 std::string format(std::string const &formatTemplate) { return formatTemplate; }
 
 template <typename Arg>
@@ -117,7 +98,8 @@ std::string format(std::string const &formatTemplate, Arg arg, Args... args) {
   return os.str();
 }
 
-
+// Memory structure for an Expert, so we can have std::vector<Expert> instead of
+// a bunch of vectors. Efficiency was not on my mind when deciding this.
 struct Expert {
 	std::size_t size;
 	std::vector<float> weights;
@@ -154,16 +136,18 @@ int main(int argc, char** argv) {
 
 	// Initialize some source data
 	assert(product(src_dims) == data["src"].num_vals);
+	assert(product(src_dims) * sizeof(float) == data["src"].num_bytes());
 	std::vector<float> src_data(data["src"].as_vec<float>());
 
 	std::vector<float> dst_data(product(dst_dims));
 
-	// Initialize router with some random data
+	// Initialize router with data from npz. All of this assumes we
 
 	assert(expert_count * token_count == data["router"].num_vals);
+	assert(expert_count * token_count * sizeof(uint8_t) == data["router"].num_bytes());
 	std::vector<uint8_t> router(data["router"].as_vec<uint8_t>());
 
-	// Initialize experts with rubbish
+	// Initialize experts with data from npz
 
 	std::vector<Expert> experts;
 
