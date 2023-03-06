@@ -2,6 +2,7 @@
 #include <cmath> // sin, tan, cos
 #include <cstring> // memcpy
 #include <iostream>
+#include <iomanip>
 #include <numeric>
 #include <unordered_map>
 #include <vector>
@@ -41,6 +42,48 @@ void write_to_dnnl_memory(void *handle, dnnl::memory &mem) {
 	if (!dst) throw std::runtime_error("get_data_handle returned nullptr.");
 	for (size_t i = 0; i < size; ++i)
 			dst[i] = ((uint8_t *) handle)[i];
+}
+
+template <typename T>
+struct matrix {
+	size_t w;
+	size_t h;
+	T* data;
+};
+
+template <typename T>
+struct number {
+	T const &val;
+};
+
+template <typename T>
+std::ostream &operator<<(std::ostream &out, number<T> const &number) {
+	return out << std::scientific << std::setw(10) << number.val;
+}
+
+template <>
+std::ostream &operator<<(std::ostream &out, number<uint8_t> const &number) {
+	return out << std::fixed << std::setw(4) << static_cast<size_t>(number.val);
+}
+
+template <typename T>
+std::ostream &operator<<(std::ostream &out, matrix<T> const &matrix) {
+	// store precision so we can restore it.
+	const auto default_precision(out.precision());
+	const auto default_width(out.width());
+
+	out << std::setprecision(2);
+	out << "(" << matrix.w << "x" << matrix.h << ") " << typeid(T).name() << " {\n";
+	for (size_t x = 0; x < matrix.w; ++x) {
+		for (size_t y = 0; y < matrix.h; ++y) {
+			out << (y > 0 ? "," : " ") << number<T>{matrix.data[x*matrix.h + y]};
+		}
+		out << "\n";
+	}
+	out << "}\n";
+
+	// Restore previous precision
+	return out << std::setprecision(default_precision) << std::setw(default_width);
 }
 
 struct Expert {
@@ -106,24 +149,31 @@ int main(int argc, char** argv) {
 
 	auto src_mem = memory(src_desc, engine, src_data.data());
 	auto dst_mem = memory(dst_desc, engine, dst_data.data());
-	
+
+	std::cout << "src_data = " << matrix<float>{token_count, embedding_size, src_data.data()};
+
+	std::cout << "router = " << matrix<uint8_t>{expert_count, token_count, router.data()};
+
 	std::vector<memory::desc> concat_src_desc;
 	std::vector<memory> concat_src_mems;
 
 	concat_src_desc.reserve(token_count);
 	concat_src_mems.reserve(token_count);
+	std::unordered_map<int, memory> concat_args;
 
 	for (size_t i = 0; i < expert_count; ++i) {
+		// === oneDNN call to concat() to select rows for expert ===
 		concat_src_desc.clear();
 		concat_src_mems.clear();
+		concat_args.clear();
 
-		for (auto j = expert_count * i, end = expert_count * (i + 1); j != end; ++j) {
-			if (!router[j])
+		for (auto j = 0; j != token_count; ++j) {
+			if (!router[token_count * i + j])
 				continue;
-
+			
 			concat_src_desc.emplace_back(memory::dims{1, embedding_size}, dt::f32, tag::ab);
-			concat_src_mems.emplace_back(concat_src_desc.back(), engine,
-				reinterpret_cast<float*>(src_mem.get_data_handle()) + j * embedding_size); // make the dnnl::memory object a view of a small part of the original input memory
+			concat_src_mems.emplace_back(concat_src_desc.back(), engine, reinterpret_cast<float*>(src_mem.get_data_handle()) + j * embedding_size); // make the dnnl::memory object a view of a small part of the original input memory
+			concat_args.insert({DNNL_ARG_MULTIPLE_SRC + (concat_src_mems.size() - 1), concat_src_mems.back()});
 		}
 
 		memory::dim expert_token_count = concat_src_mems.size();
@@ -132,16 +182,39 @@ int main(int argc, char** argv) {
 		auto concat_desc = concat::primitive_desc(engine, 0, concat_src_desc);
 		auto concat_prim = concat(concat_desc);
 
-		std::unordered_map<int, memory> concat_args;
-		for (int n = 0; n < concat_src_mems.size(); ++n) {
-			concat_args.insert({DNNL_ARG_MULTIPLE_SRC + n, concat_src_mems[n]});
-		}
-		
 		auto expert_src_desc = memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab);
 		auto expert_src_mem = memory(expert_src_desc, engine);
 		concat_args.insert({DNNL_ARG_DST, expert_src_mem});
 
 		concat_prim.execute(engine_stream, concat_args);
+
+		engine_stream.wait(); // Purely for debugging
+		
+		/*
+		// === Naieve implementation of concat ===
+		memory::dim expert_token_count = std::accumulate(&router[token_count * i], &router[token_count * (i + 1)], 0, [](uint8_t acc, uint8_t val) {
+			return acc + (val ? 1 : 0);
+		});
+
+		auto expert_src_desc = memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab);
+		auto expert_src_mem = memory(expert_src_desc, engine);
+
+		for (auto j = 0, dst_offset = 0; j < token_count; ++j) {
+			// Find the next True in the router to figure out the offset in dst_mem
+			if (!router[token_count * i + j])
+				continue;
+
+			std::cerr << "memcpy(" << (embedding_size * dst_offset) << ", " << (embedding_size * j) << ")" << std::endl;
+			std::memcpy(
+				reinterpret_cast<float*>(expert_src_mem.get_data_handle()) + (embedding_size * dst_offset++),
+				reinterpret_cast<float*>(src_mem.get_data_handle()) + (embedding_size * j),
+				embedding_size * sizeof(float));
+		}
+		*/
+
+		std::cout << "expert_" << i << "_src_mem = " << matrix<float>{
+			static_cast<size_t>(expert_token_count), embedding_size,
+			reinterpret_cast<float*>(expert_src_mem.get_data_handle())};
 
 		auto expert_dst_desc = memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab);
 		auto expert_dst_mem = memory(expert_dst_desc, engine);
@@ -178,7 +251,7 @@ int main(int argc, char** argv) {
 		
 		for (auto j = 0, dst_offset = 0; j < expert_token_count; ++j, ++dst_offset) {
 			// Find the next True in the router to figure out the offset in dst_mem
-			while (!router[expert_count * i + dst_offset])
+			while (!router[token_count * i + dst_offset])
 				++dst_offset;
 
 			std::memcpy(
@@ -186,12 +259,23 @@ int main(int argc, char** argv) {
 				reinterpret_cast<float*>(expert_dst_mem.get_data_handle()) + (embedding_size * j),
 				embedding_size * sizeof(float));
 		}
+
+		std::cout << "dst_data (after expert " << i << ") = " << matrix<float>{token_count, embedding_size, reinterpret_cast<float*>(dst_mem.get_data_handle())};
 	}
 
-	// Wait for the computation to finalize.
-	engine_stream.wait();
+	std::cout << "expected dst_data = " << matrix<float>{token_count, embedding_size, data["dst"].data<float>()};
 
-	// TODO: Compare output
+	// Wait for the computation to finalize.
+	// engine_stream.wait();
+
+	// === Compare output ===
+	float summed_abs_diff = 0;
+	float* dst_mem_ptr = reinterpret_cast<float*>(dst_mem.get_data_handle());
+	float* ref_mem_ptr = data["dst"].data<float>();
+	for (size_t i = 0; i < token_count * embedding_size; ++i) {
+		summed_abs_diff += std::fabs(dst_mem_ptr[i] - ref_mem_ptr[i]);
+	}
+	std::cout << "sum(|a-b|) = " << summed_abs_diff << std::endl;
 
 	return 0;
 }
