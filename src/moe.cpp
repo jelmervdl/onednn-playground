@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <cmath> // sin, tan, cos
 #include <cstring> // memcpy
 #include <iostream>
 #include <iomanip>
