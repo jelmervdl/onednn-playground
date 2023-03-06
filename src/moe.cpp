@@ -58,7 +58,7 @@ struct number {
 
 template <typename T>
 std::ostream &operator<<(std::ostream &out, number<T> const &number) {
-	return out << std::scientific << std::setw(10) << number.val;
+	return out << std::fixed << std::setw(8) << number.val;
 }
 
 template <>
@@ -72,7 +72,7 @@ std::ostream &operator<<(std::ostream &out, matrix<T> const &matrix) {
 	const auto default_precision(out.precision());
 	const auto default_width(out.width());
 
-	out << std::setprecision(2);
+	out << std::setprecision(4);
 	out << "(" << matrix.w << "x" << matrix.h << ") " << typeid(T).name() << " {\n";
 	for (size_t x = 0; x < matrix.w; ++x) {
 		for (size_t y = 0; y < matrix.h; ++y) {
@@ -85,6 +85,30 @@ std::ostream &operator<<(std::ostream &out, matrix<T> const &matrix) {
 	// Restore previous precision
 	return out << std::setprecision(default_precision) << std::setw(default_width);
 }
+
+/// Very simple replacement for std::format introduced in C++20. Only supports
+/// replacing `{}` in the template string with whatever `operator<<` for that
+/// type turns it into.
+std::string format(std::string const &formatTemplate) { return formatTemplate; }
+
+template <typename Arg>
+std::string format(std::string const &formatTemplate, Arg arg) {
+  std::ostringstream os;
+  auto index = formatTemplate.find("{}");
+  assert(index != std::string::npos);
+  os << formatTemplate.substr(0, index) << arg << formatTemplate.substr(index + 2);
+  return os.str();
+}
+
+template <typename Arg, typename... Args>
+std::string format(std::string const &formatTemplate, Arg arg, Args... args) {
+  std::ostringstream os;
+  auto index = formatTemplate.find("{}");
+  assert(index != std::string::npos);
+  os << formatTemplate.substr(0, index) << arg << format(formatTemplate.substr(index + 2), std::forward<Args>(args)...);
+  return os.str();
+}
+
 
 struct Expert {
 	std::size_t size;
@@ -110,6 +134,8 @@ int main(int argc, char** argv) {
 
 	// Tensor dimensions.
 	const memory::dim expert_count = 3, token_count = 7, embedding_size = 5;
+
+	float b = 0.1; // bypass multiplier
 
 	// Source (src), weights, bias, and destination (dst) tensors dimensions.
 	memory::dims src_dims = {token_count, embedding_size};
@@ -154,6 +180,16 @@ int main(int argc, char** argv) {
 
 	std::cout << "router = " << matrix<uint8_t>{expert_count, token_count, router.data()};
 
+	// === Copy src directly to dst which can serve as bypass for when a token is not selected by any expert ===
+	auto bypass_desc = dnnl::eltwise_forward::primitive_desc(engine, prop_kind::forward_training, algorithm::eltwise_linear, src_desc, dst_desc, b, 0.0f);
+	auto bypass_prim = eltwise_forward(bypass_desc);
+	std::unordered_map<int, memory> bypass_args{
+		{DNNL_ARG_SRC, src_mem},
+		{DNNL_ARG_DST, dst_mem}
+	};
+	bypass_prim.execute(engine_stream, bypass_args);
+
+	// Memory used by concat primitive to create an expert's input
 	std::vector<memory::desc> concat_src_desc;
 	std::vector<memory> concat_src_mems;
 
@@ -170,7 +206,7 @@ int main(int argc, char** argv) {
 		for (auto j = 0; j != token_count; ++j) {
 			if (!router[token_count * i + j])
 				continue;
-			
+
 			concat_src_desc.emplace_back(memory::dims{1, embedding_size}, dt::f32, tag::ab);
 			concat_src_mems.emplace_back(concat_src_desc.back(), engine, reinterpret_cast<float*>(src_mem.get_data_handle()) + j * embedding_size); // make the dnnl::memory object a view of a small part of the original input memory
 			concat_args.insert({DNNL_ARG_MULTIPLE_SRC + (concat_src_mems.size() - 1), concat_src_mems.back()});
@@ -189,9 +225,9 @@ int main(int argc, char** argv) {
 		concat_prim.execute(engine_stream, concat_args);
 
 		engine_stream.wait(); // Purely for debugging
-		
+
 		/*
-		// === Naieve implementation of concat ===
+		// === Naive implementation of concat ===
 		memory::dim expert_token_count = std::accumulate(&router[token_count * i], &router[token_count * (i + 1)], 0, [](uint8_t acc, uint8_t val) {
 			return acc + (val ? 1 : 0);
 		});
@@ -245,10 +281,14 @@ int main(int argc, char** argv) {
 		// Primitive execution: matrix multiplication
 		matmul_prim.execute(engine_stream, matmul_args);
 
+		// std::cout << "expert_" << i << "_weights = " << matrix<float>{embedding_size,embedding_size,reinterpret_cast<float*>(expert_weights_mem.get_data_handle())};
+		std::cout << "expert_" << i << "_dst = " << matrix<float>{static_cast<size_t>(expert_token_count), embedding_size, reinterpret_cast<float*>(expert_dst_mem.get_data_handle())};
+		std::cout << "expected expert_" << i << "_dst_mem = " << matrix<float>{static_cast<size_t>(expert_token_count), embedding_size, data[format("expert_{}_dst", i)].data<float>()};
+		
 		// Copy results from expert back to final output memory
 		// TODO: Find way to do this with oneDNN primitives
 		engine_stream.wait();
-		
+
 		for (auto j = 0, dst_offset = 0; j < expert_token_count; ++j, ++dst_offset) {
 			// Find the next True in the router to figure out the offset in dst_mem
 			while (!router[token_count * i + dst_offset])
