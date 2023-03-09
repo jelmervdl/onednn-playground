@@ -5,6 +5,7 @@
 #include <numeric>
 #include <unordered_map>
 #include <vector>
+#include <cmath>
 #include "../3rd_party/cnpy/cnpy.h"
 #include "oneapi/dnnl/dnnl.hpp"
 #include "oneapi/dnnl/dnnl_types.h"
