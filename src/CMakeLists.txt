@@ -6,5 +6,7 @@ add_executable(moe moe.cpp)
 target_link_libraries(moe oneDNN::lib cnpy)
 
 find_package(OpenMP)
-target_link_libraries(moe OpenMP::OpenMP_CXX)
+if(OpenMP_CXX_FOUND)
+	target_link_libraries(moe OpenMP::OpenMP_CXX)
+endif()
 
