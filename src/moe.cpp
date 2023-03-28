@@ -348,12 +348,22 @@ int main(int argc, char** argv) {
 		auto expert_b2_desc = memory::desc(expert_b2_dims, dt::f32, tag::ab);
 		auto expert_b2_mem = memory(expert_b2_desc, engine, experts[i].b2.data());
 
+		const float alpha = 0.f;
+		const float beta = 0.f;
+
+		post_ops matmul_ops;
+		matmul_ops.append_eltwise(algorithm::eltwise_relu, alpha, beta);
+
+		primitive_attr matmul_attr;
+		matmul_attr.set_post_ops(matmul_ops);
+
 		// Create primitive descriptor.
 		auto matmul_m1_desc = matmul::primitive_desc(engine,
 			expert_src_desc,
 			expert_w1_desc,
 			expert_b1_desc,
-			expert_tmp_desc);
+			expert_tmp_desc,
+			matmul_attr);
 
 		// Create the primitive.
 		auto matmul_m1_prim = matmul(matmul_m1_desc);
@@ -371,7 +381,8 @@ int main(int argc, char** argv) {
 			expert_tmp_desc,
 			expert_w2_desc,
 			expert_b2_desc,
-			expert_dst_desc);
+			expert_dst_desc,
+			matmul_attr);
 
 		// Create the primitive.
 		auto matmul_m2_prim = matmul(matmul_m2_desc);
