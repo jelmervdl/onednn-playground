@@ -396,10 +396,6 @@ int main(int argc, char** argv) {
 
 		engine_stream.wait(); // For debugging only
 
-		std::cout << "expert_" << i << "_w1 = " << matrix<float>(expert_w1_mem);
-		std::cout << "expert_" << i << "_b1 = " << matrix<float>(expert_b1_mem);
-		std::cout << "expert_" << i << "_tmp = " << matrix<float>(expert_tmp_mem);
-
 		std::cout << "expert_" << i << "_dst = " << matrix<float>(expert_dst_mem);
 		std::cout << "expected expert_" << i << "_dst_mem = " << matrix<float>(expert_token_count, embedding_size, data[format("expert_{}_dst", i)]);
 
