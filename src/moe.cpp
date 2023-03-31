@@ -272,7 +272,7 @@ int main(int argc, char** argv) {
 
 	for (size_t i = 0; i < expert_count; ++i) {
 		// Token count per expert, so we know how much memory to allocate
-		memory::dim expert_token_count = std::accumulate(&router[token_count * i], &router[token_count * (i + 1)], 0, [](uint8_t acc, uint8_t val) {
+		memory::dim expert_token_count = std::accumulate(&router[token_count * i], &router[token_count * (i + 1)], 0, [](memory::dim acc, float val) {
 			return acc + (val ? 1 : 0);
 		});
 
