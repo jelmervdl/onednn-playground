@@ -13,9 +13,11 @@
 // Uncomment for using oneDNN for index_select. Otherwise memcpy will be used.
 #define CONCAT_INDEX_SELECT
 
-// Uncomment for index_restore using oneDNN concat at the end. Otherwise a
-// memcpy after each expert will be used.
-#define CONCAT_INDEX_RESTORE
+// Uncomment to collect the router weights while selecting tokens for the
+// expert and execute the binary-mul as a post-op of the expert's linear layer.
+// Otherwise the weight multiplier will be applied when the expert's output
+// is copied back into the final merged output.
+// #define WEIGH_EXPERT_JOINED
 
 using namespace dnnl;
 
@@ -225,6 +227,9 @@ int main(int argc, char** argv) {
 	assert(expert_count * token_count * sizeof(float) == data["router"].num_bytes());
 	std::vector<float> router(data["router"].as_vec<float>());
 
+	auto router_desc = memory::desc({expert_count, token_count}, dt::f32, tag::ab);
+	auto router_mem = memory(router_desc, engine, router.data());
+
 	// Initialize experts with data from npz
 
 	std::vector<Expert> experts;
@@ -251,8 +256,17 @@ int main(int argc, char** argv) {
 
 	std::cout << "router = " << matrix<float>{expert_count, token_count, router.data()};
 
+	// === Copy src directly to dst which can serve as bypass for when a token is not selected by any expert ===
+	auto bypass_desc = dnnl::eltwise_forward::primitive_desc(engine, prop_kind::forward_training, algorithm::eltwise_linear, src_desc, dst_desc, b, 0.0f);
+	auto bypass_prim = eltwise_forward(bypass_desc);
+	std::unordered_map<int, memory> bypass_args{
+		{DNNL_ARG_SRC, src_mem},
+		{DNNL_ARG_DST, dst_mem}
+	};
+	bypass_prim.execute(engine_stream, bypass_args);
+
 	// Memory used by concat primitive to create an expert's input (and output)
-#if defined(CONCAT_INDEX_SELECT) || defined(CONCAT_INDEX_RESTORE)
+#if defined(CONCAT_INDEX_SELECT)
 	std::vector<memory::desc> concat_src_desc;
 	std::vector<memory> concat_src_mems;
 
@@ -261,16 +275,24 @@ int main(int argc, char** argv) {
 	std::unordered_map<int, memory> concat_args;
 #endif
 
-#ifdef CONCAT_INDEX_RESTORE
-	// Memory for the experts. We keep it around so we can concat the bits we
-	// want at the end into the final MoE output.
-	std::vector<memory::desc> expert_dst_descs;
-	std::vector<memory> expert_dst_mems;
-	expert_dst_descs.reserve(expert_count);
-	expert_dst_mems.reserve(expert_count);
-#endif
-
 	for (size_t i = 0; i < expert_count; ++i) {
+		/**
+		 * Every expert will basically execute:
+		 * ```py
+		 *   # Create a filter that selects which tokens go into this expert
+		 *   mask = router[expert,:] > 0
+		 *   expert_input = tokens[mask]
+		 * 
+		 *   # Linear layer + relu
+     *   expert_output1 = np.maximum(0.0, np.add(np.matmul(expert_input, expert_w1), expert_b1))
+     *   expert_output2 = np.maximum(0.0, np.add(np.matmul(expert_output1, expert_w2), expert_b2))
+     * 
+     *   # Multiply by the per-token weights in the router, add to final output in the same slots
+     *   # as the tokens appeared in the original input
+     *   total_output[mask] += router[mask][:,np.newaxis] * expert_output2
+     * ```
+     */
+
 		// Token count per expert, so we know how much memory to allocate
 		memory::dim expert_token_count = std::accumulate(&router[token_count * i], &router[token_count * (i + 1)], 0, [](memory::dim acc, float val) {
 			return acc + (val ? 1 : 0);
@@ -285,21 +307,26 @@ int main(int argc, char** argv) {
 		auto expert_tmp_desc = memory::desc({expert_token_count, expert_size}, dt::f32, tag::ab);
 		auto expert_tmp_mem = memory(expert_tmp_desc, engine);
 
-#ifdef CONCAT_INDEX_RESTORE
-		// Expert output memory, to be selectively added to dst_mem eventually.
-		// We keep them around in vectors so we can use them later in the final concat.
-		auto expert_dst_desc = expert_dst_descs.emplace_back(memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab));
-		auto expert_dst_mem = expert_dst_mems.emplace_back(memory(expert_dst_desc, engine));
-#else
 		// Expert output memory, to be selectively added to dst_mem eventually
 		auto expert_dst_desc = memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab);
 		auto expert_dst_mem = memory(expert_dst_desc, engine);
-#endif
 
 		// Cut short excluded experts. Bit late, but at this point the expert will
 		// at least appear in the exert_dst_descs list.
 		if (expert_token_count == 0)
 			continue;
+
+#ifdef WEIGH_EXPERT_JOINED
+		// Also collect the router's weights for the tokens we accepted.
+		// TODO: Maybe if there was a smarter way to store a sparse router, this
+		// could be a cheap operation as we're just selecting by 1 dimension and
+		// then ditch all the zeros.
+		auto expert_router_desc = memory::desc({expert_token_count, 1}, dt::f32, tag::ab);
+		auto expert_router_mem = memory(expert_router_desc, engine);
+
+		// (quick raw pointer for easy access)
+		auto expert_router_mem_ptr = reinterpret_cast<float*>(expert_router_mem.get_data_handle());
+#endif
 
 #ifdef CONCAT_INDEX_SELECT
 		// === oneDNN call to concat() to select rows for expert ===
@@ -310,6 +337,10 @@ int main(int argc, char** argv) {
 		for (auto j = 0; j != token_count; ++j) {
 			if (!router[token_count * i + j])
 				continue;
+
+#ifdef WEIGH_EXPERT_JOINED
+			*expert_router_mem_ptr++ = router[token_count * i + j];
+#endif
 
 			// make the dnnl::memory object a view of a small part of the original input memory
 			concat_src_desc.emplace_back(src_desc.submemory_desc(memory::dims{1, embedding_size}, {j, 0}));
@@ -330,6 +361,10 @@ int main(int argc, char** argv) {
 			if (!router[token_count * i + j])
 				continue;
 
+#ifdef WEIGH_EXPERT_JOINED
+			*expert_router_mem_ptr++ = router[token_count * i + j];
+#endif
+
 			std::cerr << "memcpy(" << (embedding_size * dst_offset) << ", " << (embedding_size * j) << ")" << std::endl;
 			std::memcpy(
 				reinterpret_cast<float*>(expert_src_mem.get_data_handle()) + (embedding_size * dst_offset++),
@@ -338,24 +373,10 @@ int main(int argc, char** argv) {
 		}
 #endif
 
+
 		engine_stream.wait(); // Purely for debugging
 		std::cout << "expert_" << i << "_src_mem = " << matrix<float>(expert_src_mem);
 		std::cout << "expected expert_" << i << "_src_mem = " << matrix<float>(expert_token_count, embedding_size, data[format("expert_{}_src", i)]);
-
-		// Initialise expert's output with the bypass values (we'll be adding to it)
-		auto expert_bypass_desc = eltwise_forward::primitive_desc(engine,
-			prop_kind::forward_training,
-			algorithm::eltwise_linear,
-			expert_src_desc,
-			expert_dst_desc,
-			b,
-			0.0f);
-
-		auto expert_bypass_prim = eltwise_forward(expert_bypass_desc);
-		expert_bypass_prim.execute(engine_stream, std::unordered_map<int, memory>{
-			{DNNL_ARG_SRC, expert_src_mem},
-			{DNNL_ARG_DST, expert_dst_mem}
-		});
 
 		// Expert weights and biases (these are all the same shape for every expert)
 		auto expert_w1_desc = memory::desc(expert_w1_dims, dt::f32, tag::ab);
@@ -399,10 +420,16 @@ int main(int argc, char** argv) {
 			{DNNL_ARG_DST,     expert_tmp_mem},
 		});
 
-		// Same as previous post-op, but also tells it to sum output to expert's output
 		post_ops final_matmul_ops;
+		
+		// Same as previous post-op...
 		final_matmul_ops.append_eltwise(algorithm::eltwise_relu, alpha, beta);
-		final_matmul_ops.append_sum();
+
+#ifdef WEIGH_EXPERT_JOINED	
+		// ... but multiply the matmul outputs by the router (per-token per-expert weights)
+		auto binary_mul_idx = final_matmul_ops.len();
+		final_matmul_ops.append_binary(algorithm::binary_mul, expert_router_desc);
+#endif
 
 		primitive_attr final_matmul_attr;
 		final_matmul_attr.set_post_ops(final_matmul_ops);
@@ -423,71 +450,68 @@ int main(int argc, char** argv) {
 			{DNNL_ARG_WEIGHTS, expert_w2_mem},
 			{DNNL_ARG_BIAS,    expert_b2_mem},
 			{DNNL_ARG_DST,     expert_dst_mem},
+#ifdef WEIGH_EXPERT_JOINED
+			{DNNL_ARG_ATTR_MULTIPLE_POST_OP(binary_mul_idx) | DNNL_ARG_SRC_1, expert_router_mem},
+#endif
 		});
 
+#ifndef WEIGH_EXPERT_JOINED
+		// Only printing this in the scenario where we didn't add the binary_mul
+		// post-op to multiply by the weights. Because we don't do that in Python,
+		// so the comparison is void at that point.
 		engine_stream.wait(); // For debugging only
-
 		std::cout << "expert_" << i << "_dst = " << matrix<float>(expert_dst_mem);
 		std::cout << "expected expert_" << i << "_dst_mem = " << matrix<float>(expert_token_count, embedding_size, data[format("expert_{}_dst", i)]);
+#endif
 
-#ifndef CONCAT_INDEX_RESTORE
-		engine_stream.wait(); // Wait for memory to settle
-
-		for (auto j = 0, dst_offset = 0; j < token_count; ++j) {
+		// Copy data back to the final output. Since we're doing Top-K and we want
+		// to sum the expert of multiple experts per token, we're just going to
+		// for-loop binary add for each row. I'm open to better implementations!
+		for (auto j = 0, dst_offset = 0; j < expert_token_count; ++j, ++dst_offset) {
 			// Find the next True in the router to figure out the offset in dst_mem
-			if (!router[token_count * i + j])
-				continue;
+			while (!router[token_count * i + dst_offset])
+				++dst_offset;
 
-			std::memcpy(
-				reinterpret_cast<float*>(dst_mem.get_data_handle()) + (embedding_size * dst_offset++),
-				reinterpret_cast<float*>(expert_dst_mem.get_data_handle()) + (embedding_size * j),
-				embedding_size * sizeof(float));
-		}
+			auto expert_slice_desc = expert_dst_desc.submemory_desc({1, embedding_size}, {j, 0});
+			auto dst_slice_desc = dst_desc.submemory_desc({1, embedding_size}, {dst_offset, 0});
+
+#ifdef WEIGH_EXPERT_JOINED
+			auto binary_desc = binary::primitive_desc(engine, algorithm::binary_add,
+				expert_slice_desc, // source 0
+				dst_slice_desc,    // source 1
+				dst_slice_desc);   // dest
+
+			auto binary_prim = binary(binary_desc);
+			binary_prim.execute(engine_stream, {
+				{DNNL_ARG_SRC_0, expert_dst_mem},
+				{DNNL_ARG_SRC_1, dst_mem},
+				{DNNL_ARG_DST, dst_mem}
+			});
+#else
+			// Select weight from router. This will be broadcasted to {1,embedding_size}.
+			auto router_slice_desc = router_desc.submemory_desc({1, 1}, {static_cast<memory::dim>(i), dst_offset});
+
+			post_ops binary_post_ops;
+			binary_post_ops.append_sum();
+
+			primitive_attr binary_attr;
+			binary_attr.set_post_ops(binary_post_ops);
+
+			auto binary_desc = binary::primitive_desc(engine, algorithm::binary_mul,
+				expert_slice_desc, // source 0
+				router_slice_desc, // source 1
+				dst_slice_desc,    // dest
+				binary_attr);
+
+			auto binary_prim = binary(binary_desc);
+			binary_prim.execute(engine_stream, {
+				{DNNL_ARG_SRC_0, expert_dst_mem},
+				{DNNL_ARG_SRC_1, router_mem},
+				{DNNL_ARG_DST, dst_mem}
+			});
 #endif
-	}
-
-#ifdef CONCAT_INDEX_RESTORE
-	concat_src_desc.clear();
-	concat_src_mems.clear();
-	concat_args.clear();
-
-	// token offset per expert
-	std::vector<memory::dim> expert_offsets(expert_count, 0);
-	
-	for (auto j = 0; j < token_count; ++j) {
-		// TODO: I wish I could transpose the router for a bit, and get it
-		// token-major instead of expert-major.
-		
-		// Find out which expert this token has to be read from.
-		size_t expert_i = expert_count;
-		for (size_t i = 0; i < expert_count; ++i) {
-			if (router[i * token_count + j]) {
-				expert_i = i;
-				break;
-			}
 		}
-
-		// Was this token routed to any expert? We assume so, otherwise our indices
-		// will be off.
-		assert(expert_i < expert_count);
-
-		std::cerr << "Taking token " << j << " from expert " << expert_i << std::endl;
-
-		// make the dnnl::memory object a view of a small part of the original expert's output memory
-		concat_src_desc.emplace_back(expert_dst_descs[expert_i].submemory_desc(memory::dims{1, embedding_size}, {expert_offsets[expert_i]++, 0}));
-		concat_src_mems.emplace_back(concat_src_desc.back(), engine, expert_dst_mems[expert_i].get_data_handle());
-		concat_args.insert({DNNL_ARG_MULTIPLE_SRC + (concat_src_mems.size() - 1), concat_src_mems.back()});
 	}
-
-	// Create concat primitive descriptor.
-	auto concat_desc = concat::primitive_desc(engine, 0, concat_src_desc);
-	auto concat_prim = concat(concat_desc);
-
-	// output to the final massive matrix
-	concat_args.insert({DNNL_ARG_DST, dst_mem});
-
-	concat_prim.execute(engine_stream, concat_args);
-#endif
 
 	// Wait for the computation to finalize.
 	engine_stream.wait();
