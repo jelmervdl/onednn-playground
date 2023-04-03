@@ -439,8 +439,8 @@ int main(int argc, char** argv) {
 				continue;
 
 			std::memcpy(
-				reinterpret_cast<float*>(dst_mem.get_data_handle()) + (embedding_size * dst_offset++),
-				reinterpret_cast<float*>(expert_dst_mem.get_data_handle()) + (embedding_size * j),
+				reinterpret_cast<float*>(dst_mem.get_data_handle()) + (embedding_size * j),
+				reinterpret_cast<float*>(expert_dst_mem.get_data_handle()) + (embedding_size * dst_offset++),
 				embedding_size * sizeof(float));
 		}
 #endif
